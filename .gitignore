@@ -1,0 +1,24 @@
+# Secrets — never commit these
+config.json
+ig-session.json
+
+# Runtime state
+outreach-state.json
+discovered-creators.json
+
+# Debug + screening screenshots
+debug-*.png
+screen-*.png
+
+# Dependencies
+node_modules/
+
+# OS
+.DS_Store
+
+# Firecrawl cache
+.firecrawl/
+
+# Old manual prompts (personal)
+dm-prompts.md
+instagram-outreach-prompt.md

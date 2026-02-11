@@ -1,0 +1,44 @@
+{
+  "instagram": {
+    "username": "your_email@example.com",
+    "password": "your_password"
+  },
+  "trendsweep": {
+    "apiKey": "your_trendsweep_api_key"
+  },
+  "openai": {
+    "apiKey": "your_openai_api_key (optional, for profile screening)"
+  },
+  "screening": {
+    "enabled": false,
+    "targetAudience": "Indian or South Asian"
+  },
+  "product": {
+    "name": "My Product",
+    "url": "https://yourproduct.com/",
+    "pitch": "i built this cool tool that does X. my friends and i have been seeing great results from it",
+    "linkMessage": "check it out if you want: https://yourproduct.com/",
+    "askMessage": "its free rn btw. if you think your audience would find it useful, even a quick story mention would mean a lot",
+    "followUpMessage": "hey just following up, did you get a chance to check it out? would love your honest thoughts. no pressure at all!"
+  },
+  "outreach": {
+    "searchQueries": [
+      "your niche topic 1",
+      "your niche topic 2",
+      "your niche topic 3"
+    ],
+    "openerStyle": "casual",
+    "hooks": {
+      "resume": "your resume tips are so real",
+      "interview": "your interview advice is actually so good",
+      "visa": "your visa stuff is literally what people need rn",
+      "linkedin": "your linkedin tips are fire honestly",
+      "job search": "your job search content hit different",
+      "career": "your career content is genuinely helpful",
+      "hiring": "your hiring takes are so on point",
+      "layoff": "your take on the layoff stuff is so real",
+      "default": "your content is genuinely helpful"
+    },
+    "selfIntro": ""
+  }
+}

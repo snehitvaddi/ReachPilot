@@ -7,8 +7,15 @@ outreach-state.json
 discovered-creators.json
 
 # Debug + screening screenshots
+debug/
 debug-*.png
 screen-*.png
+
+# Generated reports (personal data)
+dashboard.html
+sent-dms.csv
+results-summary.md
+pending-followup.txt
 
 # Dependencies
 node_modules/

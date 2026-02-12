@@ -1,13 +1,14 @@
 /**
  * ReachPilot — Automated Instagram DM Outreach
  *
- * Discovers creators via TrendSweep Atlas API and sends them
- * personalized Instagram DMs with human-like behavior.
+ * Discovers creators via API search or Instagram native search,
+ * and sends them personalized Instagram DMs with human-like behavior.
  *
  * Usage:
- *   node ig-outreach.mjs discover   # Find creators (no DMs)
- *   node ig-outreach.mjs send       # Discover + send DMs
- *   node ig-outreach.mjs followup   # Check replies + follow up
+ *   node reachpilot.mjs discover    # Find creators via API (no DMs)
+ *   node reachpilot.mjs send        # Discover + send DMs
+ *   node reachpilot.mjs igsearch    # Search Instagram directly + send DMs
+ *   node reachpilot.mjs followup    # Check replies + follow up
  *
  * Config: Copy config.example.json → config.json and fill in your details.
  * Env vars (IG_USER, IG_PASS, TRENDSWEEP_KEY) override config if set.
@@ -38,10 +39,48 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY || CONFIG.openai?.apiKey || "";
 const SCREENING_ENABLED = CONFIG.screening?.enabled ?? false;
 const TARGET_AUDIENCE = CONFIG.screening?.targetAudience || "Indian or South Asian";
 
+// ── Debug Helper ─────────────────────────────────────────────────────────────
+
+const DEBUG_DIR = path.join(DIR, "debug");
+if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
+
+async function debugCapture(page, label) {
+  const ts = Date.now();
+  const safeName = label.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60);
+  try {
+    const screenshotPath = path.join(DEBUG_DIR, `${safeName}-${ts}.png`);
+    await page.screenshot({ path: screenshotPath, fullPage: false });
+    log(`      📸 Debug screenshot: debug/${safeName}-${ts}.png`);
+
+    const htmlPath = path.join(DEBUG_DIR, `${safeName}-${ts}.html`);
+    const html = await page.content();
+    fs.writeFileSync(htmlPath, html, "utf-8");
+    log(`      📄 Debug HTML: debug/${safeName}-${ts}.html`);
+
+    // Also extract and log all <a href="/username/"> style links for quick diagnosis
+    const links = await page.evaluate(() => {
+      return [...document.querySelectorAll('a[href^="/"]')]
+        .map(a => a.href.replace(window.location.origin, ''))
+        .filter(h => /^\/[a-zA-Z0-9._]+\/?$/.test(h))
+        .slice(0, 20);
+    });
+    if (links.length > 0) {
+      log(`      🔗 Profile-like links found: ${links.join(', ')}`);
+    } else {
+      log(`      🔗 No profile-like links found on page`);
+    }
+
+    return { screenshotPath, htmlPath, links };
+  } catch (err) {
+    log(`      ⚠️ Debug capture failed: ${err.message}`);
+    return null;
+  }
+}
+
 // ── Profile Screening via OpenAI Vision ─────────────────────────────────────
 
 async function screenProfile(page, handle) {
-  if (!SCREENING_ENABLED || !OPENAI_KEY) return true; // skip screening if disabled
+  if (!SCREENING_ENABLED || !OPENAI_KEY) return { passes: true, gender: "unknown" }; // skip screening if disabled
 
   // Scroll to top so profile pic + bio are visible
   await page.evaluate(() => window.scrollTo({ top: 0, behavior: "smooth" }));
@@ -61,14 +100,18 @@ async function screenProfile(page, handle) {
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        max_tokens: 100,
+        max_tokens: 150,
         messages: [
           {
             role: "user",
             content: [
               {
                 type: "text",
-                text: `Look at this Instagram profile screenshot. Based on the profile photo, name, bio, and any visible details, does this person appear to be ${TARGET_AUDIENCE}? Reply with ONLY "YES" or "NO" and a brief reason (max 10 words).`,
+                text: `Look at this Instagram profile screenshot. Answer these questions:
+1. Does this person appear to be ${TARGET_AUDIENCE}? Reply with "YES" or "NO"
+2. What is their apparent gender? Reply with "male", "female", or "unknown"
+
+Format your response as: MATCH: YES/NO | GENDER: male/female/unknown | REASON: (brief reason, max 15 words)`,
               },
               {
                 type: "image_url",
@@ -82,22 +125,29 @@ async function screenProfile(page, handle) {
 
     const data = await res.json();
     const answer = data.choices?.[0]?.message?.content?.trim() || "";
-    const isMatch = answer.toUpperCase().startsWith("YES");
 
-    log(`  Screening @${handle}: ${answer} → ${isMatch ? "MATCH" : "SKIP"}`);
+    // Parse response
+    const isMatch = answer.toUpperCase().includes("MATCH: YES");
+    let gender = "unknown";
+    const genderMatch = answer.match(/GENDER:\s*(male|female|unknown)/i);
+    if (genderMatch) {
+      gender = genderMatch[1].toLowerCase();
+    }
+
+    log(`  Screening @${handle}: ${answer} → ${isMatch ? "MATCH" : "SKIP"} (${gender})`);
 
     // Clean up screenshot
     try { fs.unlinkSync(screenshotPath); } catch {}
 
-    return isMatch;
+    return { passes: isMatch, gender };
   } catch (err) {
     log(`  Screening error for @${handle}: ${err.message}. Proceeding anyway.`);
     try { fs.unlinkSync(screenshotPath); } catch {}
-    return true; // on error, don't skip
+    return { passes: true, gender: "unknown" }; // on error, don't skip
   }
 }
 
-// ── TrendSweep API: Discover Creators ───────────────────────────────────────
+// ── Creator Discovery API ───────────────────────────────────────────────────
 
 const SEARCH_QUERIES = CONFIG.outreach?.searchQueries || [
   "resume tips job application career advice for job seekers",
@@ -141,7 +191,7 @@ const HOOKS = CONFIG.outreach?.hooks || {
   default: "your content is genuinely helpful",
 };
 
-function generateFirstLine(creator) {
+function generateFirstLine(creator, gender = "unknown") {
   const desc = (creator.description || creator.caption || "").slice(0, 150).toLowerCase();
 
   let hook = HOOKS.default;
@@ -151,14 +201,23 @@ function generateFirstLine(creator) {
   }
 
   const name = creator.name || "";
-  const greeting = name ? `Hey ${name}!` : "Hey!";
+  let greeting;
+
+  if (name) {
+    greeting = `Hey ${name}!`;
+  } else if (gender === "male") {
+    greeting = "Hey bro!";
+  } else {
+    greeting = "Hey!";
+  }
+
   const selfIntro = CONFIG.outreach?.selfIntro || "";
 
   return `${greeting} just came across your reel and ${hook}${selfIntro ? ". " + selfIntro : ""}`;
 }
 
 async function discoverCreators() {
-  log("=== Phase 1: Discovering creators via TrendSweep Atlas API ===\n");
+  log("=== Phase 1: Discovering creators via API ===\n");
 
   const allVideos = [];
 
@@ -518,7 +577,8 @@ async function sendMessages(page, handle, messages) {
     await messageBtn.first().click();
     log(`  Clicked Message button.`);
   } catch {
-    log(`  !! No Message button for @${handle}. Skipping.`);
+    log(`  !! No Message button for @${handle}. Capturing debug...`);
+    await debugCapture(page, `no-msg-btn-${handle}`);
     return false;
   }
 
@@ -535,7 +595,8 @@ async function sendMessages(page, handle, messages) {
   try {
     await msgInput.first().waitFor({ timeout: 10000 });
   } catch {
-    log(`  !! No message input for @${handle}. Skipping.`);
+    log(`  !! No message input for @${handle}. Capturing debug...`);
+    await debugCapture(page, `no-msg-input-${handle}`);
     return false;
   }
 
@@ -684,8 +745,8 @@ async function runSend() {
       await browseProfile(page);
 
       // Screen profile (nationality check via vision API)
-      const passesScreening = await screenProfile(page, c.handle);
-      if (!passesScreening) {
+      const screenResult = await screenProfile(page, c.handle);
+      if (!screenResult.passes) {
         log(`  Skipping @${c.handle} — does not match target audience.`);
         state[c.handle] = {
           sent: false, sentAt: null, skipped: true, skippedReason: "screening",
@@ -695,9 +756,16 @@ async function runSend() {
         continue;
       }
 
-      // Build messages
+      // Build messages with personalized greeting based on gender
+      const firstLine = generateFirstLine({
+        handle: c.handle,
+        name: c.name,
+        description: c.description,
+        caption: c.caption,
+      }, screenResult.gender);
+
       const allMessages = [
-        c.firstLine,
+        firstLine,
         ...MESSAGES_AFTER_FIRST,
       ];
 
@@ -854,29 +922,592 @@ async function runFollowup() {
   }
 }
 
+// ── Instagram Search: extract creator handle from post/reel dialog ──────────
+
+async function extractCreatorHandle(page) {
+  const selectors = [
+    'article header a[href^="/"]',
+    'div[role="dialog"] header a[href^="/"]',
+    'div[role="dialog"] a[href^="/"][role="link"]',
+    'section > main a[href^="/"][role="link"]',
+  ];
+  const skip = new Set([
+    "explore", "reels", "reel", "accounts", "direct",
+    "stories", "p", "about", "legal", "privacy", "terms",
+  ]);
+  for (const sel of selectors) {
+    try {
+      const el = page.locator(sel).first();
+      const href = await el.getAttribute("href", { timeout: 2000 });
+      if (!href) continue;
+      const m = href.match(/^\/([a-zA-Z0-9._]+)\/?$/);
+      if (!m || skip.has(m[1])) continue;
+      return m[1];
+    } catch {}
+  }
+  return null;
+}
+
+// ── Instagram Search: capture suggestions + search each one ──────────────────
+
+async function searchInstagramForCreators(page, query, state) {
+  const found = [];
+
+  log(`  📝 Typing query: "${query}"`);
+
+  // ── Step 1: Open search and type to get suggestions ──
+  await dismissPopups(page);
+
+  // Click search icon
+  const searchIcon = page.locator('[aria-label="Search"]');
+  try {
+    await searchIcon.first().waitFor({ timeout: 5000 });
+    await searchIcon.first().click();
+  } catch {
+    log(`  ⚠️ Search icon not found`);
+    return found;
+  }
+  await sleep(rand(800, 1500));
+
+  // Type the query
+  const searchInput = page.locator('input[placeholder="Search"]');
+  try {
+    await searchInput.first().waitFor({ timeout: 5000 });
+    await searchInput.first().click();
+    await searchInput.first().fill("");
+    await humanType(page, query);
+    await sleep(rand(2500, 3500));
+  } catch (err) {
+    log(`  ⚠️ Could not type in search: ${err.message}`);
+    return found;
+  }
+
+  // ── Step 2: Extract suggestion URLs from dropdown ──
+  log(`  🔍 Extracting search suggestion URLs...`);
+
+  const suggestionUrls = [];
+
+  try {
+    // Find all keyword suggestion links using correct selector from HTML
+    const suggestionLinks = await page.locator('a[role="link"]:has(svg[aria-label="Keyword"])').all();
+
+    log(`  ✓ Found ${suggestionLinks.length} suggestions`);
+
+    // Extract hrefs from first 5 suggestions
+    for (let i = 0; i < Math.min(suggestionLinks.length, 5); i++) {
+      const href = await suggestionLinks[i].getAttribute('href');
+      if (href) {
+        const fullUrl = href.startsWith('http') ? href : `https://www.instagram.com${href}`;
+        suggestionUrls.push(fullUrl);
+        log(`    → ${fullUrl}`);
+      }
+    }
+  } catch (err) {
+    log(`  ⚠️ Could not extract suggestions: ${err.message}`);
+  }
+
+  // Close search panel
+  await page.keyboard.press("Escape").catch(() => {});
+  await sleep(rand(500, 1000));
+
+  if (suggestionUrls.length === 0) {
+    log(`  ⚠️ No suggestions found, using original query only`);
+    const encodedQuery = encodeURIComponent(query);
+    suggestionUrls.push(`https://www.instagram.com/explore/search/keyword/?q=${encodedQuery}`);
+  }
+
+  // ── Step 3: Open each suggestion in NEW TAB and process reels ──
+  const context = page.context();
+
+  for (let i = 0; i < suggestionUrls.length; i++) {
+    let suggestionTab = null;
+
+    try {
+      log(`\n  🔎 [${i + 1}/${suggestionUrls.length}] Opening suggestion in new tab...`);
+
+      // Open suggestion in NEW TAB
+      suggestionTab = await context.newPage();
+      await suggestionTab.goto(suggestionUrls[i]);
+      await sleep(rand(4000, 6000));
+      await dismissPopups(suggestionTab);
+
+      // Find posts on this suggestion's results page (Instagram shows reels as /p/ or /reel/ links in search)
+      const reelLinks = await suggestionTab.locator('a[href*="/p/"], a[href*="/reel/"]').all();
+      log(`    Found ${reelLinks.length} posts in suggestion ${i + 1}`);
+
+      // Debug: capture suggestion page if no posts found
+      if (reelLinks.length === 0) {
+        log(`    ⚠️ No posts found on suggestion page, capturing debug...`);
+        await debugCapture(suggestionTab, `suggestion-${i + 1}-empty`);
+      }
+
+      // Extract reel URLs (limit to 24 per suggestion), deduplicate
+      const reelUrls = [];
+      const seenUrls = new Set();
+      for (let j = 0; j < Math.min(reelLinks.length, 24); j++) {
+        const href = await reelLinks[j].getAttribute('href');
+        if (href) {
+          const fullUrl = href.startsWith('http') ? href : `https://www.instagram.com${href}`;
+          if (!seenUrls.has(fullUrl)) {
+            seenUrls.add(fullUrl);
+            reelUrls.push(fullUrl);
+          }
+        }
+      }
+      log(`    Unique post URLs to process: ${reelUrls.length}`);
+
+      // ── Process each post in ANOTHER NEW TAB ──
+      for (let j = 0; j < reelUrls.length; j++) {
+        let postTab = null;
+        let profileTab = null;
+
+        try {
+          log(`    [Post ${j + 1}/${reelUrls.length}] Opening post in new tab...`);
+
+          // Open post in ANOTHER NEW TAB
+          postTab = await context.newPage();
+          await postTab.goto(reelUrls[j]);
+          await sleep(rand(2500, 4000));
+          await dismissPopups(postTab);
+
+          // Extract username from post page using multiple strategies
+          log(`      Extracting username from post page...`);
+
+          let handle = null;
+
+          // Strategy 1: Look for the post author link in the page via JS evaluation
+          // This is the most reliable — directly evaluates the DOM
+          try {
+            handle = await postTab.evaluate(() => {
+              const skipPages = new Set(["explore", "reels", "reel", "accounts", "direct", "stories", "p", "tv", "about", "legal", "privacy", "terms", "tags", "locations"]);
+
+              // Try: links inside spans that look like usernames (Instagram's typical structure)
+              const allLinks = document.querySelectorAll('a[href^="/"]');
+              for (const a of allLinks) {
+                const href = a.getAttribute('href');
+                const m = href.match(/^\/([a-zA-Z0-9._]{1,30})\/?$/);
+                if (!m || skipPages.has(m[1])) continue;
+
+                // Prioritize links that contain a span with the username text
+                // (these are typically the author username in post headers)
+                const span = a.querySelector('span');
+                if (span && span.textContent.trim() === m[1]) {
+                  return m[1];
+                }
+              }
+
+              // Fallback: first link that looks like /username/
+              for (const a of allLinks) {
+                const href = a.getAttribute('href');
+                const m = href.match(/^\/([a-zA-Z0-9._]{1,30})\/?$/);
+                if (m && !skipPages.has(m[1])) return m[1];
+              }
+
+              return null;
+            });
+          } catch {}
+
+          // Strategy 2: Try meta tags (og:url often contains the post author info, or alternate URL)
+          if (!handle) {
+            try {
+              handle = await postTab.evaluate(() => {
+                // Check canonical/alternate link or meta property
+                const metaAuthor = document.querySelector('meta[property="instapp:owner_user_id"]');
+                const ogTitle = document.querySelector('meta[property="og:title"]');
+                if (ogTitle) {
+                  // og:title is often like "@username on Instagram: ..."
+                  const m = ogTitle.content?.match(/@([a-zA-Z0-9._]{1,30})/);
+                  if (m) return m[1];
+                  // Or "Username on Instagram"
+                  const m2 = ogTitle.content?.match(/^([a-zA-Z0-9._]{1,30})\s+on\s+Instagram/i);
+                  if (m2) return m2[1];
+                }
+
+                // Check title tag
+                const title = document.title || "";
+                const tm = title.match(/@([a-zA-Z0-9._]{1,30})/);
+                if (tm) return tm[1];
+                const tm2 = title.match(/^([a-zA-Z0-9._]{1,30})\s+on\s+Instagram/i);
+                if (tm2) return tm2[1];
+
+                return null;
+              });
+            } catch {}
+          }
+
+          // Strategy 3: Check the page URL itself (some reels redirect to /reel/ with username in content)
+          if (!handle) {
+            try {
+              const pageUrl = postTab.url();
+              // Instagram reel URLs sometimes have /username/reel/xxx pattern
+              const urlMatch = pageUrl.match(/instagram\.com\/([a-zA-Z0-9._]{1,30})\/(?:reel|p)\//);
+              if (urlMatch) handle = urlMatch[1];
+            } catch {}
+          }
+
+          if (!handle) {
+            log(`      ⚠️ Could not find username on post page, capturing debug...`);
+            await debugCapture(postTab, `post-no-username-${j + 1}`);
+            await postTab.close();
+            continue;
+          }
+
+          log(`      ✓ Found username: @${handle}`);
+
+          // Skip own profile (can't message yourself!)
+          const ownHandle = CONFIG.instagram?.handle || "";
+          if (ownHandle && handle.toLowerCase() === ownHandle.toLowerCase()) {
+            log(`      ⊗ Skipping own profile @${handle}`);
+            await postTab.close();
+            continue;
+          }
+
+          // Skip only if successfully sent OR properly screened out
+          if (state[handle]) {
+            if (state[handle].sent) {
+              log(`      ⊗ @${handle} already sent DM`);
+              await postTab.close();
+              continue;
+            } else if (state[handle].skippedReason === "screening") {
+              log(`      ⊗ @${handle} failed screening`);
+              await postTab.close();
+              continue;
+            } else {
+              // Entry exists but DM failed previously - retry it
+              log(`      ⚠️ @${handle} found in state but DM not sent, retrying...`);
+            }
+          }
+
+          if (found.includes(handle)) {
+            log(`      ⊗ @${handle} already found this session`);
+            await postTab.close();
+            continue;
+          }
+
+          // Open profile in NEW TAB by navigating to it
+          try {
+            log(`      Opening profile for @${handle} in new tab...`);
+            profileTab = await context.newPage();
+            await profileTab.goto(`https://www.instagram.com/${handle}/`, {
+              waitUntil: "domcontentloaded",
+            });
+            await sleep(rand(2500, 4000));
+            await dismissPopups(profileTab);
+
+            log(`      ✓ Profile opened for @${handle}`);
+
+            // Browse profile
+            await browseProfile(profileTab);
+
+            // Screen profile with gender detection
+            const screenResult = await screenProfile(profileTab, handle);
+            if (!screenResult.passes) {
+              log(`      Skipping @${handle} — does not match target audience.`);
+              state[handle] = {
+                sent: false,
+                sentAt: null,
+                skipped: true,
+                skippedReason: "screening",
+                skippedAt: new Date().toISOString(),
+                replied: false,
+                followedUp: false,
+                reelUrl: reelUrls[j],
+                source: "ig",
+              };
+              saveState(state);
+
+              // Close profile and post tabs
+              await profileTab.close();
+              await postTab.close();
+              await sleep(rand(1000, 1500));
+              continue;
+            }
+
+            // Generate personalized first line with gender
+            const firstLine = generateFirstLine({
+              handle,
+              name: null,
+              description: "",
+              caption: "",
+            }, screenResult.gender);
+
+            const allMessages = [firstLine, ...MESSAGES_AFTER_FIRST];
+
+            // Send DMs on profile tab
+            const success = await sendMessages(profileTab, handle, allMessages);
+
+            state[handle] = {
+              sent: success,
+              sentAt: success ? new Date().toISOString() : null,
+              skipped: !success,
+              replied: false,
+              followedUp: false,
+              reelUrl: reelUrls[j],
+              source: "ig",
+            };
+            saveState(state);
+
+            if (success) {
+              log(`      ✅ DMs sent to @${handle}`);
+              found.push(handle);
+            }
+
+            // Close profile tab
+            await profileTab.close();
+            await sleep(rand(800, 1500));
+
+          } catch (err) {
+            log(`      ⚠️ Error processing profile for @${handle}: ${err.message}`);
+            if (profileTab) {
+              await debugCapture(profileTab, `profile-error-${handle}`).catch(() => {});
+              await profileTab.close().catch(() => {});
+            }
+          }
+
+          // Close post tab
+          await postTab.close();
+          await sleep(rand(1000, 2000));
+
+        } catch (err) {
+          log(`      Error processing post ${j + 1}: ${err.message}`);
+          // Capture debug from post tab if still open
+          if (postTab) {
+            await debugCapture(postTab, `post-error-${j + 1}`).catch(() => {});
+            await postTab.close().catch(() => {});
+          }
+          if (profileTab) await profileTab.close().catch(() => {});
+          await sleep(500);
+        }
+      }
+
+      // Close suggestion tab after all reels processed
+      log(`    ✓ Closing suggestion ${i + 1} tab`);
+      await suggestionTab.close();
+      await sleep(rand(1000, 2000));
+
+    } catch (err) {
+      log(`    ⚠️ Error with suggestion ${i + 1}: ${err.message}`);
+      // Make sure we close the suggestion tab even on error
+      if (suggestionTab) {
+        await suggestionTab.close().catch(() => {});
+      }
+      await sleep(500);
+    }
+  }
+
+  log(`  ✓ Discovered ${found.length} new creators from "${query}" and its suggestions`);
+  return found;
+}
+
+// ── Main: Instagram Search + DM ─────────────────────────────────────────────
+
+async function runIGSearch() {
+  const username = process.env.IG_USER || CONFIG.instagram?.username;
+  const password = process.env.IG_PASS || CONFIG.instagram?.password;
+
+  if (!username || !password) {
+    console.error("Set IG_USER/IG_PASS env vars or add instagram credentials to config.json");
+    process.exit(1);
+  }
+
+  log("=== Instagram Search Mode: Discover + DM ===\n");
+
+  const state = loadState();
+  const hasSession = fs.existsSync(SESSION_FILE);
+
+  const browser = await chromium.launch({ headless: false, slowMo: 30 });
+  const context = await browser.newContext({
+    ...(hasSession ? { storageState: SESSION_FILE } : {}),
+    viewport: { width: 1280, height: 900 },
+    locale: "en-US",
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  });
+  const page = await context.newPage();
+
+  try {
+    if (hasSession) {
+      log("Reusing saved session...");
+      await page.goto("https://www.instagram.com/", {
+        waitUntil: "domcontentloaded",
+      });
+      await sleep(3000);
+      const isLoggedIn = await page
+        .locator('[aria-label="Home"]')
+        .first()
+        .isVisible({ timeout: 5000 })
+        .catch(() => false);
+      if (!isLoggedIn) await login(page, username, password);
+      else log("Session valid.");
+    } else {
+      await login(page, username, password);
+    }
+
+    await context.storageState({ path: SESSION_FILE });
+    await browseFeed(page);
+
+    const queries = CONFIG.outreach?.igSearchQueries || [
+      "resume tips",
+      "job search advice",
+      "career coach",
+      "h1b visa tips",
+      "interview tips",
+      "ats resume",
+    ];
+
+    let totalDiscovered = 0;
+    let totalSent = 0;
+
+    for (const query of queries) {
+      log(`\n══ Searching Instagram: "${query}" ══`);
+      const newHandles = await searchInstagramForCreators(page, query, state);
+      totalDiscovered += newHandles.length;
+
+      for (const handle of newHandles) {
+        // Skip own profile (can't message yourself!)
+        const ownHandle = CONFIG.instagram?.handle || "";
+        if (ownHandle && handle.toLowerCase() === ownHandle.toLowerCase()) {
+          log(`  Skipping own profile @${handle}`);
+          continue;
+        }
+
+        // Skip only if successfully sent OR properly screened out
+        if (state[handle]) {
+          if (state[handle].sent) {
+            log(`  Already sent DM to @${handle}, skipping.`);
+            continue;
+          } else if (state[handle].skippedReason === "screening") {
+            log(`  @${handle} failed screening, skipping.`);
+            continue;
+          } else {
+            // Entry exists but DM failed previously - retry it
+            log(`  @${handle} found in state but DM not sent, retrying...`);
+          }
+        }
+
+        log(`\n  ─ New creator: @${handle} ─`);
+
+        // Open profile in NEW TAB for screening and DMing
+        const profileTab = await context.newPage();
+
+        try {
+          // Navigate to profile in new tab
+          await profileTab.goto(`https://www.instagram.com/${handle}/`, {
+            waitUntil: "domcontentloaded",
+          });
+          await sleep(rand(2000, 3000));
+          await dismissPopups(profileTab);
+          await browseProfile(profileTab);
+
+          // Screen profile in new tab with gender detection
+          const screenResult = await screenProfile(profileTab, handle);
+          if (!screenResult.passes) {
+            log(`  Skipping @${handle} — does not match target audience.`);
+            state[handle] = {
+              sent: false,
+              sentAt: null,
+              skipped: true,
+              skippedReason: "screening",
+              skippedAt: new Date().toISOString(),
+              replied: false,
+              followedUp: false,
+              reelUrl: "",
+              source: "ig-search",
+            };
+            saveState(state);
+            await profileTab.close();
+            continue;
+          }
+
+          // Generate first line using query keywords for hook matching with gender-based greeting
+          const firstLine = generateFirstLine({
+            handle,
+            name: null,
+            description: query,
+            caption: query,
+          }, screenResult.gender);
+          const allMessages = [firstLine, ...MESSAGES_AFTER_FIRST];
+
+          // Send DMs in new tab
+          const success = await sendMessages(profileTab, handle, allMessages);
+          state[handle] = {
+            sent: success,
+            sentAt: success ? new Date().toISOString() : null,
+            skipped: !success,
+            replied: false,
+            followedUp: false,
+            reelUrl: "",
+            source: "ig-search",
+          };
+          saveState(state);
+
+          if (success) {
+            totalSent++;
+          }
+
+          // Close profile tab and return to main search page
+          await profileTab.close();
+          await sleep(rand(1500, 2500));
+
+          // Browse feed in main page between creators
+          await browseFeed(page);
+
+        } catch (err) {
+          log(`  Error processing @${handle}: ${err.message}`);
+          await profileTab.close().catch(() => {});
+          continue;
+        }
+      }
+
+      // Browse feed between searches
+      await browseFeed(page);
+    }
+
+    await context.storageState({ path: SESSION_FILE });
+
+    log("\n========== IG SEARCH SUMMARY ==========");
+    log(`Discovered: ${totalDiscovered} | Sent: ${totalSent}`);
+    const igCreators = Object.entries(state).filter(
+      ([, s]) => s.source === "ig-search"
+    );
+    for (const [handle, s] of igCreators) {
+      const status = s.sent
+        ? "SENT"
+        : s.skippedReason === "screening"
+          ? "SCREENED OUT"
+          : "SKIPPED";
+      log(`  @${handle.padEnd(25)} — ${status}`);
+    }
+  } catch (err) {
+    console.error("Error:", err.message);
+    saveState(state);
+  } finally {
+    log("Done. Closing in 10s...");
+    await sleep(10000);
+    await browser.close();
+  }
+}
+
 // ── Entry ───────────────────────────────────────────────────────────────────
 
 const mode = process.argv[2];
 
 if (mode === "discover") runDiscover();
 else if (mode === "send") runSend();
+else if (mode === "igsearch") runIGSearch();
 else if (mode === "followup") runFollowup();
 else {
   console.log(`
-TrendSweep → Instagram DM Outreach Pipeline
+ReachPilot — Automated Instagram DM Outreach
 =============================================
 
-  TRENDSWEEP_KEY=ak_... node ig-outreach.mjs discover
-    → Query TrendSweep API, find creators, preview messages (no DMs sent)
-
-  IG_USER=you IG_PASS=pass TRENDSWEEP_KEY=ak_... node ig-outreach.mjs send
-    → Discover creators + send personalized DMs on Instagram
-
-  IG_USER=you IG_PASS=pass node ig-outreach.mjs followup
-    → Check for replies + send follow-up messages
+  node reachpilot.mjs discover     → Find creators via API (no DMs)
+  node reachpilot.mjs send         → Discover creators + send DMs
+  node reachpilot.mjs igsearch     → Search Instagram natively + screen + DM
+  node reachpilot.mjs followup     → Check replies + send follow-ups
 
 Files:
-  discovered-creators.json  — Cached creator list from TrendSweep
+  discovered-creators.json  — Cached creator list from discovery
   outreach-state.json       — Tracks sent/replied/followed-up per creator
   ig-session.json           — Instagram session cookies (auto-login)
   `);

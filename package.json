@@ -1,14 +1,14 @@
 {
   "name": "reachpilot",
   "version": "1.0.0",
-  "description": "Automated Instagram DM outreach via TrendSweep creator discovery",
+  "description": "Automated Instagram DM outreach — discover creators and send personalized DMs",
   "type": "module",
   "scripts": {
-    "discover": "node ig-outreach.mjs discover",
-    "send": "node ig-outreach.mjs send",
-    "followup": "node ig-outreach.mjs followup"
+    "discover": "node reachpilot.mjs discover",
+    "send": "node reachpilot.mjs send",
+    "followup": "node reachpilot.mjs followup"
   },
-  "keywords": ["instagram", "outreach", "automation", "trendsweep"],
+  "keywords": ["instagram", "outreach", "automation", "reachpilot", "dm"],
   "license": "MIT",
   "dependencies": {
     "playwright": "^1.58.2"

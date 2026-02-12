@@ -1,7 +1,8 @@
 {
   "instagram": {
     "username": "your_email@example.com",
-    "password": "your_password"
+    "password": "your_password",
+    "handle": "your_instagram_handle"
   },
   "trendsweep": {
     "apiKey": "your_trendsweep_api_key"
@@ -26,6 +27,11 @@
       "your niche topic 1",
       "your niche topic 2",
       "your niche topic 3"
+    ],
+    "igSearchQueries": [
+      "short keyword 1",
+      "short keyword 2",
+      "short keyword 3"
     ],
     "openerStyle": "casual",
     "hooks": {
